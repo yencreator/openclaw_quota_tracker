@@ -2,6 +2,7 @@
 """
 OpenClaw Quota Tracker - Real API Usage
 Tracks actual API usage from OpenClaw session logs
+Only counts TODAY's usage!
 """
 
 import json
@@ -14,29 +15,11 @@ import glob
 SESSIONS_DIR = Path("/home/openclaw/.openclaw/agents/main/sessions")
 DATA_FILE = Path(__file__).parent / "data" / "quota.json"
 
-# Default quota configurations
-DEFAULT_QUOTAS = {
-    "minimax": {
-        "name": "MiniMax",
-        "description": "MiniMax API (每4小時配額)",
-        "quota_type": "rate_limit",
-        "limit": 50000000,  # 50M tokens per 4 hours
-        "period_hours": 4
-    },
-    "claude_pro": {
-        "name": "Claude Pro (阿鷹)",
-        "description": "Claude Code - Claude Pro 訂閱",
-        "quota_type": "subscription",
-        "limit": "unlimited",
-        "note": "Pro 方案無用量限制"
-    },
-    "gemini_pro": {
-        "name": "Gemini Pro (小龍)",
-        "description": "Gemini CLI - Google AI Pro 訂閱",
-        "quota_type": "subscription", 
-        "limit": "unlimited",
-        "note": "Pro 方案無用量限制"
-    }
+# MiniMax pricing (from their website)
+# Input: $15 / 1M tokens, Output: $60 / 1M tokens
+MINIMAX_PRICING = {
+    "input_per_million": 15.0,
+    "output_per_million": 60.0
 }
 
 def load_data():
@@ -45,24 +28,19 @@ def load_data():
     if DATA_FILE.exists():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"quotas": DEFAULT_QUOTAS, "usage": {}, "last_check": datetime.now().isoformat()}
+    return {"quotas": {}, "usage": {}, "last_check": datetime.now().isoformat()}
 
-def save_data(data):
-    """Save quota data"""
-    DATA_FILE.parent.mkdir(exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def parse_session_usage():
-    """Parse actual usage from OpenClaw session logs"""
-    total_cost = 0.0
+def parse_today_usage():
+    """Parse ONLY today's usage from OpenClaw session logs"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_date = datetime.now().date()
+    
     total_input = 0
     total_output = 0
     total_tokens = 0
     session_count = 0
     
     try:
-        # Get all session files
         session_files = glob.glob(str(SESSIONS_DIR / "*.jsonl"))
         
         for session_file in session_files:
@@ -71,38 +49,49 @@ def parse_session_usage():
                     for line in f:
                         try:
                             data = json.loads(line)
-                            # Look for usage in the message
-                            if isinstance(data, dict):
-                                # Check for Anthropic-style usage
-                                if "usage" in data:
-                                    usage = data.get("usage", {})
-                                    if isinstance(usage, dict):
-                                        cost = usage.get("cost", {})
-                                        if isinstance(cost, dict):
-                                            total_cost += cost.get("total", 0)
-                                        total_input += usage.get("input", 0)
-                                        total_output += usage.get("output", 0)
-                                        total_tokens += usage.get("totalTokens", 0)
-                                        session_count += 1
-                                        
-                                # Check nested message structure
-                                content = data.get("message", {})
-                                if isinstance(content, dict):
-                                    usage = content.get("usage", {})
-                                    if isinstance(usage, dict):
-                                        cost = usage.get("cost", {})
-                                        if isinstance(cost, dict):
-                                            total_cost += cost.get("total", 0)
-                                        total_input += usage.get("input", 0)
-                                        total_output += usage.get("output", 0)
-                                        total_tokens += usage.get("totalTokens", 0)
-                                        session_count += 1
+                            
+                            # Check timestamp - check BOTH UTC and local date
+                            timestamp = data.get("timestamp", "")
+                            if not timestamp:
+                                continue
+                            try:
+                                # Parse as UTC
+                                ts_dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                                ts_date_utc = ts_dt.date()
+                                ts_date_local = (ts_dt + timedelta(hours=8)).date()
+                                
+                                # Accept either UTC today OR local today
+                                if ts_date_utc != today_date and ts_date_local != today_date:
+                                    continue
+                            except:
+                                continue
+                            
+                            # Look for usage
+                            usage = None
+                            
+                            if "usage" in data and isinstance(data["usage"], dict):
+                                usage = data["usage"]
+                            elif "message" in data and isinstance(data["message"], dict):
+                                if "usage" in data["message"]:
+                                    usage = data["message"]["usage"]
+                            
+                            if usage:
+                                total_input += usage.get("input", 0)
+                                total_output += usage.get("output", 0)
+                                total_tokens += usage.get("totalTokens", 0)
+                                session_count += 1
+                                
                         except:
                             continue
             except:
                 continue
     except Exception as e:
-        print(f"Error reading sessions: {e}")
+        print(f"Error: {e}")
+    
+    # Calculate cost with correct MiniMax pricing
+    input_cost = (total_input / 1_000_000) * MINIMAX_PRICING["input_per_million"]
+    output_cost = (total_output / 1_000_000) * MINIMAX_PRICING["output_per_million"]
+    total_cost = input_cost + output_cost
     
     return {
         "total_cost": round(total_cost, 4),
@@ -113,25 +102,21 @@ def parse_session_usage():
     }
 
 def generate_report():
-    """Generate quota report with REAL data"""
-    # Get real usage
-    usage = parse_session_usage()
-    data = load_data()
+    """Generate quota report with TODAY's data only"""
+    usage = parse_today_usage()
     
     report = []
     report.append("=" * 60)
-    report.append("📊 OpenClaw 配額報告 (真實數據)")
+    report.append("📊 OpenClaw 配額報告 (今日)")
     report.append(f"📅 查詢時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     report.append("=" * 60)
     
-    # MiniMax - Real usage from sessions!
-    report.append("\n🔵 MiniMax (主要模型)")
+    # MiniMax - Today's usage
+    report.append("\n🔵 MiniMax (今日用量)")
     report.append("-" * 40)
-    mm = data["quotas"].get("minimax", {})
-    report.append(f"   方案：{mm.get('description', 'N/A')}")
-    report.append(f"   配額：{mm.get('limit', 'N/A'):,} tokens/4hr")
+    report.append(f"   配額：50,000,000 tokens / 4hr")
     report.append(f"   -----------------------------------")
-    report.append(f"   📈 本次會話實際用量：")
+    report.append(f"   📈 今日用量：")
     report.append(f"      Input:  {usage['total_input']:,} tokens")
     report.append(f"      Output: {usage['total_output']:,} tokens")
     report.append(f"      Total:  {usage['total_tokens']:,} tokens")
@@ -140,41 +125,33 @@ def generate_report():
     # Claude Pro
     report.append("\n🦅 Claude Pro (阿鷹)")
     report.append("-" * 40)
-    cp = data["quotas"].get("claude_pro", {})
-    report.append(f"   方案：{cp.get('description', 'N/A')}")
-    report.append(f"   配額：{cp.get('limit', 'N/A')}")
-    report.append(f"   狀態：✅ 訂閱方案，無用量限制")
+    report.append(f"   方案：Claude Pro 訂閱")
+    report.append(f"   狀態：✅ 無用量限制")
     
     # Gemini Pro
     report.append("\n🐉 Gemini Pro (小龍)")
     report.append("-" * 40)
-    gp = data["quotas"].get("gemini_pro", {})
-    report.append(f"   方案：{gp.get('description', 'N/A')}")
-    report.append(f"   配額：{gp.get('limit', 'N/A')}")
-    report.append(f"   狀態：✅ 訂閱方案，無用量限制")
+    report.append(f"   方案：Google AI Pro 訂閱")
+    report.append(f"   狀態：✅ 無用量限制")
     
-    # Summary
     report.append("\n" + "=" * 60)
-    report.append("📈 本次 session 統計")
-    report.append("-" * 40)
-    report.append(f"   處理會話數：{usage['sessions']}")
-    report.append(f"   總花費：${usage['total_cost']:.4f} USD")
+    report.append(f"💡 計價方式：MiniMax 官網定價")
+    report.append(f"   Input: $15 / 1M tokens")
+    report.append(f"   Output: $60 / 1M tokens")
     report.append("=" * 60)
     
     return "\n".join(report)
 
 def quick_status():
     """Quick status check"""
-    usage = parse_session_usage()
-    data = load_data()
+    usage = parse_today_usage()
     
-    print("\n📊 配額狀態 (即時)")
+    print("\n📊 今日配額 (即時)")
     print("-" * 50)
-    print(f"🔵 MiniMax: ${usage['total_cost']:.4f} USD ({usage['total_tokens']:,} tokens)")
-    print(f"🦅 Claude Pro: 無限制 (訂閱)")
-    print(f"🐉 Gemini Pro: 無限制 (訂閱)")
+    print(f"🔵 MiniMax 今日: ${usage['total_cost']:.4f} ({usage['total_tokens']:,} tokens)")
+    print(f"🦅 Claude Pro: 無限制")
+    print(f"🐉 Gemini Pro: 無限制")
     print("-" * 50)
-    print(f"最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 def main():
     if len(sys.argv) > 1:
@@ -182,10 +159,6 @@ def main():
         if cmd == "report":
             print(generate_report())
         elif cmd == "status":
-            quick_status()
-        elif cmd == "init":
-            data = load_data()
-            print("✅ 配額資料已初始化")
             quick_status()
         else:
             print(f"未知指令：{cmd}")
